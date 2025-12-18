@@ -5,8 +5,16 @@ import time
 import argparse
 import websockets.exceptions
 import json
+import datetime
 from typing import Any, Union
 
+# 문자열 객체 날짜로 변환
+def parse_date(s):
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        msg = f"Not a valid date: '{s}'"
+        raise argparse.ArgumentTypeError(msg)
 
 class StockWebSocket:
     def __init__(self, tickers: Union[str, list[str]]): # 생성자
@@ -91,7 +99,7 @@ class StockWebSocket:
                     time.sleep(10)
 
             except (KeyboardInterrupt, SystemExit):
-                pass # 사용자가 종료
+                pass # Ctrl+C -> 종료
             except Exception as poll_e:
                 pass # 오류로 인한 폴링 루프 종료
 
@@ -132,8 +140,8 @@ def get_latest_price(tickers: Union[str, list[str]]) -> dict[str, dict[str, Any]
             output[ticker] = {"error": "Invalid Ticker or Network Error"}
     return output
 
-# 과거기록
-def get_historical_price_data(tickers: Union[str, list[str]], period: str = "1mo", interval: str = "1d", num: int = 30) -> dict[str, dict[str, Any]]:
+# 과거기록_dictioinary 반환
+def get_historical_price_data(tickers: Union[str, list[str]], period: str = "1mo", interval: str = "1d", num: int = 0) -> dict[str, dict[str, Any]]:
     if isinstance(tickers, str):
         tickers = [tickers]
     output: dict[str, dict[str, Any]] = {ticker: {} for ticker in tickers}
@@ -182,6 +190,35 @@ def get_historical_price_data(tickers: Union[str, list[str]], period: str = "1mo
                 output[ticker] = {"error": str(e), "history": None}
     return output
 
+# 과거기록_dataframe 반환
+def get_history_df(ticker, start, end, num):
+    if start is None:
+        start = "2022-01-01"  # 시작 날짜 기본값
+    if end is None:
+        end = datetime.date.today().strftime("%Y-%m-%d") # 종료 날짜 기본값 (오늘)
+    
+    try:
+        history_df =  yf.download(
+            tickers=ticker,
+            start=start,
+            end=end,
+            auto_adjust=False,
+            group_by='column',
+            progress=False
+        )
+        if history_df.empty:
+            print(f"Warning: {ticker} 데이터가 비어있습니다.")
+            return None
+
+        if num > 0:
+            if len(history_df) > num:
+                history_df = history_df.iloc[-num:] 
+        return history_df
+
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
+        return None
+
 # 펀더멘탈
 def get_fundamental_data(tickers: Union[str, list[str]]) -> dict[str, dict[str, Any]]:
     if isinstance(tickers, str):
@@ -208,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "data_type",
         type=str,
-        choices=["latest", "history", "fundamental", "websocket"],
+        choices=["latest", "history", "history_df", "fundamental", "websocket"],
         help="Type of data to fetch: 'latest' price, 'history' , or 'fundamental' info."
     )
     parser.add_argument(
@@ -233,9 +270,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num",
         type=int,
-        default=30,
+        default=0,
         help="Fetch data size"
     )
+    parser.add_argument(
+        "--start",
+        type=parse_date, # 날짜 객체
+        help="Start date (YYYY-MM-DD)"
+    )
+    parser.add_argument(
+        "--end",
+        type=parse_date, # 날짜 객체
+        help="End date (YYYY-MM-DD)"
+    )
+
     args = parser.parse_args()
     tickers_list = [ticker.strip() for ticker in args.tickers.split(',')]
     final_output = {}
@@ -264,6 +312,16 @@ if __name__ == "__main__":
                 final_output = get_historical_price_data(tickers_list, period=args.period, interval=args.interval, num=args.num)
             elif args.data_type == "fundamental":
                 final_output = get_fundamental_data(tickers_list)
+            elif args.data_type == "history_df":
+                result_df = get_history_df(tickers_list, start=args.start, end=args.end, num=args.num)
+                # 2. 결과가 진짜 DataFrame인지, 그리고 비어있지 않은지 확인합니다.
+                if isinstance(result_df, pd.DataFrame) and not result_df.empty:
+                    filename = "_".join(tickers_list) + ".csv"
+                    result_df.to_csv(filename)
+                    final_output = {"success": f"Saved to {tickers_list}.csv", "rows": len(result_df)}
+                else:
+                    # 데이터가 없거나 에러가 난 경우
+                    print({"error": "Failed to fetch dataframe. Result is None or empty."})
             else:
                 final_output = {"error": "Invalid data_type specified."}
             print(final_output)

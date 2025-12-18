@@ -1,471 +1,192 @@
-import sys
+import numpy as np
 import pandas as pd
-import pyqtgraph as pg
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QPushButton, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QInputDialog, 
-                             QMessageBox, QSpinBox, QGroupBox, QGridLayout)
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, pyqtSlot, QRectF
-from PyQt6.QtGui import QColor, QPicture, QPainter
+import stock_api as api
+import tensorflow as tf
+import argparse
+import sys
+import datetime
+from sklearn.preprocessing import MinMaxScaler
 
-# ★ stock_api.py 필요
-import stock_api
+def model(ticker, num, start, end):
+    window_size = 50
+    if isinstance(ticker, list):
+        ticker = ticker[0] # 여러 개의 티커를 받을 경우 하나만 처리
 
-# =============================================================================
-# [1] 데이터 관리 & 백엔드 클래스들 (Portfolio, Client, Loader)
-# =============================================================================
+    # 1. 주가 데이터 가져오기
+    try:
+        df = api.get_history_df(ticker, start, end, num)
+    except Exception as e:
+        print(f"API Error: {e}")
+        return
 
-class Portfolio:
-    """사용자 자산 및 보유 주식 관리 클래스"""
-    def __init__(self):
-        self.cash = 10000000.0  # 예수금 (초기 천만원)
-        self.holdings = {}      # { 'AAPL': {'qty': 10, 'avg': 150.0}, ... }
+    if df is None or df.empty:
+        sys.exit(1)
 
-    @property
-    def total_invested(self):
-        """총 매수 금액"""
-        return sum(h['qty'] * h['avg'] for h in self.holdings.values())
-
-    def get_valuation(self, current_prices):
-        """총 평가 금액 (현재가 기준)"""
-        stock_val = 0
-        for ticker, info in self.holdings.items():
-            # 현재가가 없으면 평단가로 계산
-            price = current_prices.get(ticker, info['avg'])
-            stock_val += price * info['qty']
-        return stock_val
-
-    def buy(self, ticker, price, qty):
-        cost = price * qty
-        if cost > self.cash:
-            return False, "예수금이 부족합니다."
-        
-        self.cash -= cost
-        
-        if ticker in self.holdings:
-            old = self.holdings[ticker]
-            # 평단가 갱신
-            new_avg = ((old['qty'] * old['avg']) + cost) / (old['qty'] + qty)
-            old['qty'] += qty
-            old['avg'] = new_avg
+    # MultiIndex 컬럼 처리
+    if isinstance(df.columns, pd.MultiIndex):
+        target_level = None
+        for i in range(df.columns.nlevels):
+            level_values = df.columns.get_level_values(i)
+            if 'Close' in level_values or 'Open' in level_values:
+                target_level = i
+                break
+        if target_level is not None:
+            df.columns = df.columns.get_level_values(target_level)
         else:
-            self.holdings[ticker] = {'qty': qty, 'avg': price}
-        return True, "매수 체결 완료"
+            df.columns = df.columns.get_level_values(-1)
 
-    def sell(self, ticker, price, qty):
-        if ticker not in self.holdings or self.holdings[ticker]['qty'] < qty:
-            return False, "보유 수량이 부족합니다."
+    # 2. 전처리
+    # (1) 이평선 추가
+    df['MA5'] = df['Close'].rolling(window=5).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    
+    # (3) 결측치(NaN) 제거
+    df.dropna(inplace=True)
+
+    # 3. 데이터 분할
+    feature_cols = ['Open', 'High', 'Low', 'Close', 'MA5', 'MA20']
+    target_col = ['Close']
+
+    train_size = int(len(df) * 0.8)
+    train_df = df.iloc[:train_size]
+    test_df = df.iloc[train_size:]
+
+    # 4. 스케일링
+    scaler_x = MinMaxScaler(feature_range=(0, 1))
+    scaler_y = MinMaxScaler(feature_range=(0, 1))
+
+    # Train 데이터로만 fit 수행
+    scaler_x.fit(train_df[feature_cols])
+    scaler_y.fit(train_df[target_col])
+
+    # Transform은 각각 수행
+    scaled_train_x = scaler_x.transform(train_df[feature_cols])
+    scaled_train_y = scaler_y.transform(train_df[target_col])
+    
+    scaled_test_x = scaler_x.transform(test_df[feature_cols])
+    scaled_test_y = scaler_y.transform(test_df[target_col])
+
+    # 5. Sliding Window 생성을 위해 연결 (경계선 처리)
+    total_scaled_x = np.vstack((scaled_train_x, scaled_test_x))
+    total_scaled_y = np.vstack((scaled_train_y, scaled_test_y))
+
+    X, y = [], []
+    for i in range(len(total_scaled_x) - window_size):
+        X.append(total_scaled_x[i : i + window_size])
+        y.append(total_scaled_y[i + window_size])
+
+    X, y = np.array(X), np.array(y)
+    num_features = X.shape[2]
+
+    # 다시 Train/Test 분리 (윈도우 생성 후 개수 기반)
+    # 실제 학습에 쓸 데이터 개수 계산 (앞서 계산한 비율 유지)
+    real_train_len = len(scaled_train_x) - window_size # Train 데이터 내부에서 만들 수 있는 윈도우 수
+    if real_train_len < 0: real_train_len = 0 # 예외처리
+
+    # 엄밀한 분리를 위해 재조정 (Train 데이터 끝부분 ~ Test 데이터 시작부분)
+    split_idx = int(len(X) * 0.9)
+    
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    # 6. 모델 구성
+    model = tf.keras.models.Sequential()
+    model.add(tf.keras.layers.LSTM(units=64, return_sequences=True, input_shape=(window_size, num_features)))
+    model.add(tf.keras.layers.Dropout(0.2))
+    model.add(tf.keras.layers.LSTM(units=64, return_sequences=False))
+    model.add(tf.keras.layers.Dropout(0.2))
+    model.add(tf.keras.layers.Dense(units=32))
+    model.add(tf.keras.layers.Dense(units=1))
+
+    model.compile(optimizer='adam', loss='mean_squared_error')
+
+    # EarlyStopping: Test 데이터(val_loss)가 10번(patience) 동안 좋아지지 않으면 학습 중단
+    early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, verbose=1)
+
+    # ModelCheckpoint: Test 성적이 가장 좋았을 때의 모델을 파일로 저장
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(f'best_model_{ticker}.keras', monitor='val_loss', save_best_only=True, verbose=1)
+
+    # 7. 학습 (validation_data에 X_test, y_test를 넣어줌으로써 실시간 평가)
+    print(f"\n[학습 시작] Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+    
+    history = model.fit(
+        X_train, y_train, 
+        validation_data=(X_test, y_test), # 학습 중에 계속 테스트 데이터를 훔쳐보며 성능 체크
+        batch_size=32, 
+        epochs=100, # 넉넉하게 100번 주되, EarlyStopping이 알아서 멈춤
+        callbacks=[early_stop, checkpoint], # 콜백 등록
+        verbose=1
+    )
+
+    # 8. 예측 (가장 좋았던 모델을 다시 불러와서 예측)
+    best_model = tf.keras.models.load_model(f'best_model_{ticker}.keras')
+
+    # 8. 예측 및 결과 확인
+    if len(X_test) > 0:
+        pred = best_model.predict(X_test)
+        real_pred = scaler_y.inverse_transform(pred)
+        real_actual = scaler_y.inverse_transform(y_test)
         
-        earnings = price * qty
-        self.cash += earnings
+        # [수정] 최근 결과(마지막 5일)를 출력하도록 변경
+        print("\n=== 최근 예측 결과 (마지막 5일) ===")
+        # 최근 5일치만 가져오기
+        recent_pred = real_pred[-5:]
+        recent_actual = real_actual[-5:]
         
-        self.holdings[ticker]['qty'] -= qty
-        if self.holdings[ticker]['qty'] == 0:
-            del self.holdings[ticker]
-        return True, "매도 체결 완료"
+        for i in range(len(recent_pred)):
+            print(f"D-{5-i}: 예측 {recent_pred[i][0]:.2f} / 실제 {recent_actual[i][0]:.2f}")
+    
+    # 9. 내일 주가 예측
+    last_window = total_scaled_x[-window_size:] 
+    last_window = np.reshape(last_window, (1, window_size, num_features))
+    
+    tomorrow_pred_scaled = best_model.predict(last_window)
+    tomorrow_price = scaler_y.inverse_transform(tomorrow_pred_scaled)
 
+    print("\n" + "="*40)
+    print(f"[{ticker}] 내일 예측 종가: {tomorrow_price[0][0]:,.0f}")
+    print("="*40 + "\n")
 
-class QtStockClient(stock_api.StockWebSocket, QObject):
-    """실시간 가격 수신용 (매매 버튼 활성화 핵심)"""
-    data_received_signal = pyqtSignal(dict)
-
-    def __init__(self, tickers):
-        QObject.__init__(self)
-        stock_api.StockWebSocket.__init__(self, tickers)
-
-    def _on_message(self, message):
-        try:
-            if isinstance(message, str):
-                import json
-                data = json.loads(message)
-            else:
-                data = message
-            
-            ticker = data.get('id')
-            price = data.get('price')
-
-            if price is not None:
-                self.data_received_signal.emit({"id": ticker, "price": price})
-        except Exception:
-            pass
-
-
-class DataLoader(QThread):
-    """차트 및 재무정보 로딩용 (비동기)"""
-    data_loaded = pyqtSignal(dict) 
-
-    def __init__(self, ticker, data_type, **kwargs):
-        super().__init__()
-        self.ticker = ticker
-        self.data_type = data_type
-        self.kwargs = kwargs 
-
-    def run(self):
-        result = {}
-        try:
-            if self.data_type == "history":
-                raw_data = stock_api.get_historical_price_data(self.ticker, **self.kwargs)
-                result = {"type": "history", "data": raw_data}
-            elif self.data_type == "fundamental":
-                raw_data = stock_api.get_fundamental_data(self.ticker)
-                result = {"type": "fundamental", "data": raw_data}
-        except Exception as e:
-            result = {"error": str(e)}
-        self.data_loaded.emit(result)
-
-
-class CandlestickItem(pg.GraphicsObject):
-    """캔들 차트 아이템 (수정된 버전)"""
-    def __init__(self, data):
-        pg.GraphicsObject.__init__(self)
-        self.data = data  # [(time, open, close, low, high), ...]
-        self.generatePicture()
-
-    def generatePicture(self):
-        self.picture = QPicture()
-        p = QPainter(self.picture)
-        p.setPen(pg.mkPen('w')) 
-        
-        if not self.data:
-            p.end()
-            return
-
-        if len(self.data) > 1:
-            times = [d[0] for d in self.data]
-            gaps = [(times[i+1] - times[i]) for i in range(len(times)-1)]
-            if gaps:
-                min_gap = min(gaps) 
-                w = min_gap * 0.4 
-            else:
-                w = 1.0 
-        else:
-            w = 1.0 
-
-        for (t, open, close, low, high) in self.data:
-            if open > close: # 하락 (파랑)
-                p.setBrush(pg.mkBrush((0, 0, 255)))
-                p.setPen(pg.mkPen((0, 0, 255)))
-            else: # 상승 (빨강)
-                p.setBrush(pg.mkBrush((255, 0, 0)))
-                p.setPen(pg.mkPen((255, 0, 0)))
-            
-            p.drawLine(int(t), int(low), int(t), int(high))
-            p.drawRect(QRectF(t - w, open, w * 2, close - open))
-        p.end()
-
-    def paint(self, p, *args):
-        self.picture.play(p)
-
-    def boundingRect(self):
-        return QRectF(self.picture.boundingRect())
-
-# =============================================================================
-# [2] 메인 GUI (모든 기능 통합)
-# =============================================================================
-class TradingApp(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Python AI Trader - Integrated System")
-        self.resize(1600, 900)
-
-        # 1. 데이터 관리 객체 초기화
-        self.portfolio = Portfolio()      # 포트폴리오 (매수/매도 로직)
-        self.current_prices = {}          # 현재가 저장소
-        self.target_ticker = None         # 현재 선택된 종목
-        self.client = None                # 실시간 시세 수신 클라이언트
-
-        # 2. UI 레이아웃 설정
-        central = QWidget()
-        self.setCentralWidget(central)
-        self.main_layout = QHBoxLayout(central)
-
-        self.init_chart_panel()       # 좌측: 차트
-        self.init_fundamental_panel() # 중앙: 재무정보
-        self.init_user_panel()        # 우측: 주문 및 잔고
-
-        self.main_layout.setStretch(0, 5)
-        self.main_layout.setStretch(1, 2)
-        self.main_layout.setStretch(2, 3)
-
-        # 초기 대시보드 갱신
-        self.update_dashboard()
-
-    def init_chart_panel(self):
-        panel = QWidget()
-        panel.setStyleSheet("background-color: #121212;")
-        layout = QVBoxLayout(panel)
-
-        self.lbl_ticker = QLabel("종목을 검색해주세요")
-        self.lbl_ticker.setStyleSheet("color: white; font-size: 24px; font-weight: bold;")
-        layout.addWidget(self.lbl_ticker)
-
-        # 기간 설정 버튼
-        btn_layout = QHBoxLayout()
-        periods = [("1일 (5분봉)", "1d", "5m"), ("3개월 (일봉)", "3mo", "1d"), ("10년 (월봉)", "10y", "1mo")]
-        for name, p, i in periods:
-            btn = QPushButton(name)
-            btn.setStyleSheet("background-color: #333; color: white;")
-            btn.clicked.connect(lambda _, p=p, i=i: self.load_history_data(p, i))
-            btn_layout.addWidget(btn)
-        layout.addLayout(btn_layout)
-
-        self.chart_widget = pg.PlotWidget()
-        self.chart_widget.setBackground('#121212')
-        self.chart_widget.showGrid(x=True, y=True, alpha=0.3)
-        self.date_axis = pg.DateAxisItem(orientation='bottom')
-        self.chart_widget.setAxisItems({'bottom': self.date_axis})
-        layout.addWidget(self.chart_widget)
-        self.main_layout.addWidget(panel)
-
-    def init_fundamental_panel(self):
-        panel = QWidget()
-        panel.setStyleSheet("background-color: #1e1e1e; border-right: 1px solid #444;")
-        layout = QVBoxLayout(panel)
-        
-        title = QLabel("🏢 기업 재무 정보")
-        title.setStyleSheet("color: #FFD700; font-size: 18px; font-weight: bold; margin-bottom: 15px;")
-        layout.addWidget(title)
-
-        self.fund_labels = {}
-        items = {"shortName": "기업명", "marketCap": "시가총액", "trailingPE": "PER", "trailingEps": "EPS",
-                 "totalRevenue": "매출액", "grossProfits": "매출총이익", "netIncomeToCommon": "당기순이익", "ebitda": "EBITDA"}
-
-        form_grid = QGridLayout()
-        row = 0
-        for key, name in items.items():
-            lbl_name = QLabel(name)
-            lbl_name.setStyleSheet("color: #aaa; font-weight: bold;")
-            lbl_value = QLabel("-")
-            lbl_value.setStyleSheet("color: white;")
-            lbl_value.setWordWrap(True)
-            form_grid.addWidget(lbl_name, row, 0)
-            form_grid.addWidget(lbl_value, row, 1)
-            self.fund_labels[key] = lbl_value 
-            row += 1
-
-        layout.addLayout(form_grid)
-        layout.addStretch() 
-        self.main_layout.addWidget(panel)
-
-    def init_user_panel(self):
-        panel = QWidget()
-        panel.setStyleSheet("background-color: #f5f5f5;")
-        layout = QVBoxLayout(panel)
-
-        # [A] 내 계좌 현황
-        grp_user = QGroupBox("👤 내 계좌 현황")
-        user_layout = QGridLayout()
-        
-        # 라벨 변수 저장 (update_dashboard에서 쓰기 위함)
-        self.val_cash = QLabel("-")
-        self.val_invested = QLabel("-")
-        self.val_total = QLabel("-")
-        self.val_profit = QLabel("-")
-
-        for lbl in [self.val_cash, self.val_invested, self.val_total, self.val_profit]:
-            lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #333;")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-
-        user_layout.addWidget(QLabel("예수금:"), 0, 0)
-        user_layout.addWidget(self.val_cash, 0, 1)
-        user_layout.addWidget(QLabel("총 매수금:"), 1, 0)
-        user_layout.addWidget(self.val_invested, 1, 1)
-        user_layout.addWidget(QLabel("총 자산:"), 2, 0)
-        user_layout.addWidget(self.val_total, 2, 1)
-        user_layout.addWidget(QLabel("수익률:"), 3, 0)
-        user_layout.addWidget(self.val_profit, 3, 1)
-        grp_user.setLayout(user_layout)
-        layout.addWidget(grp_user)
-
-        # [B] 주문창
-        grp_order = QGroupBox("⚡ 간편 주문")
-        order_layout = QVBoxLayout()
-        self.spin_qty = QSpinBox()
-        self.spin_qty.setRange(1, 100000)
-        
-        row_qty = QHBoxLayout()
-        row_qty.addWidget(QLabel("수량:"))
-        row_qty.addWidget(self.spin_qty)
-        order_layout.addLayout(row_qty)
-        
-        btn_box = QHBoxLayout()
-        btn_buy = QPushButton("매수 (Buy)")
-        btn_buy.setStyleSheet("background-color: #ff4444; color: white; padding: 10px; font-weight: bold;")
-        btn_buy.clicked.connect(lambda: self.execute_trade('buy')) # 매수 연결
-        
-        btn_sell = QPushButton("매도 (Sell)")
-        btn_sell.setStyleSheet("background-color: #4444ff; color: white; padding: 10px; font-weight: bold;")
-        btn_sell.clicked.connect(lambda: self.execute_trade('sell')) # 매도 연결
-
-        btn_box.addWidget(btn_buy)
-        btn_box.addWidget(btn_sell)
-        order_layout.addLayout(btn_box)
-        grp_order.setLayout(order_layout)
-        layout.addWidget(grp_order)
-
-        # [C] 보유 종목 테이블
-        layout.addWidget(QLabel("보유 종목"))
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["종목", "수량", "평단가", "수익률"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.table)
-
-        # [D] 검색 버튼
-        btn_search = QPushButton("🔍 종목 검색 / 변경")
-        btn_search.setStyleSheet("padding: 15px; background-color: #222; color: white; font-weight: bold;")
-        btn_search.clicked.connect(self.open_search_dialog)
-        layout.addWidget(btn_search)
-
-        self.main_layout.addWidget(panel)
-
-    # =========================================================================
-    # [로직] 데이터 요청 및 매매 처리
-    # =========================================================================
-    def open_search_dialog(self):
-        text, ok = QInputDialog.getText(self, "종목 검색", "Ticker 입력 (예: TSLA, AAPL):")
-        if ok and text:
-            ticker = text.strip().upper()
-            self.target_ticker = ticker
-            self.lbl_ticker.setText(f"{ticker} 데이터 수신 중...")
-            
-            # 1. 과거 데이터(차트) 및 펀더멘탈 요청 (DataLoader)
-            self.loader_fund = DataLoader(ticker, "fundamental")
-            self.loader_fund.data_loaded.connect(self.update_fundamental_ui)
-            self.loader_fund.start()
-            self.load_history_data("3mo", "1d") # 기본 차트
-
-            # 2. 실시간 시세 수신 시작 (QtStockClient) -> 이게 있어야 매매 가능!
-            if self.client: self.client.stop()
-            self.client = QtStockClient([ticker])
-            self.client.data_received_signal.connect(self.on_realtime_data)
-            self.client.start()
-
-    def load_history_data(self, period, interval):
-        if not self.target_ticker: return
-        self.chart_widget.clear()
-        self.loader_hist = DataLoader(self.target_ticker, "history", period=period, interval=interval)
-        self.loader_hist.data_loaded.connect(self.update_chart_ui)
-        self.loader_hist.start()
-
-    @pyqtSlot(dict)
-    def on_realtime_data(self, data):
-        """실시간 가격 수신 -> 현재가 저장 -> 대시보드 갱신"""
-        ticker = data['id']
-        price = data['price']
-        self.current_prices[ticker] = price # ★ 핵심: 현재가 저장
-        
-        # 선택된 종목이면 라벨 업데이트
-        if ticker == self.target_ticker:
-            self.lbl_ticker.setText(f"{ticker} : ${price:,.2f}")
-        
-        # 대시보드(수익률) 갱신
-        self.update_dashboard()
-
-    def execute_trade(self, action):
-        """매수/매도 버튼 클릭 시 실행"""
-        if not self.target_ticker or self.target_ticker not in self.current_prices:
-            QMessageBox.warning(self, "주문 실패", "현재가 정보를 수신 중입니다. 잠시 후 다시 시도해주세요.")
-            return
-
-        price = self.current_prices[self.target_ticker]
-        qty = self.spin_qty.value()
-
-        if action == 'buy':
-            ok, msg = self.portfolio.buy(self.target_ticker, price, qty)
-        else:
-            ok, msg = self.portfolio.sell(self.target_ticker, price, qty)
-            
-        if ok:
-            QMessageBox.information(self, "체결 성공", f"{msg}\n가격: ${price}\n수량: {qty}")
-            self.update_dashboard()
-        else:
-            QMessageBox.warning(self, "주문 거부", msg)
-
-    def update_dashboard(self):
-        """사용자 자산 정보 및 보유 종목 테이블 갱신"""
-        invested = self.portfolio.total_invested
-        valuation = self.portfolio.get_valuation(self.current_prices)
-        total_profit = valuation - invested
-        profit_rate = (total_profit / invested * 100) if invested > 0 else 0.0
-
-        # 라벨 갱신
-        self.val_cash.setText(f"${self.portfolio.cash:,.0f}")
-        self.val_invested.setText(f"${invested:,.0f}")
-        self.val_total.setText(f"${self.portfolio.cash + valuation:,.0f}")
-        
-        color = "red" if total_profit > 0 else "blue" if total_profit < 0 else "black"
-        self.val_profit.setText(f"${total_profit:,.0f} ({profit_rate:+.2f}%)")
-        self.val_profit.setStyleSheet(f"color: {color}; font-size: 15px; font-weight: bold;")
-
-        # 테이블 갱신
-        self.table.setRowCount(0)
-        for ticker, info in self.portfolio.holdings.items():
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            
-            curr_p = self.current_prices.get(ticker, info['avg'])
-            p_rate = ((curr_p - info['avg']) / info['avg']) * 100
-            
-            item_profit = QTableWidgetItem(f"{p_rate:+.2f}%")
-            if p_rate > 0: item_profit.setForeground(Qt.GlobalColor.red)
-            elif p_rate < 0: item_profit.setForeground(Qt.GlobalColor.blue)
-
-            self.table.setItem(row, 0, QTableWidgetItem(ticker))
-            self.table.setItem(row, 1, QTableWidgetItem(str(info['qty'])))
-            self.table.setItem(row, 2, QTableWidgetItem(f"${info['avg']:,.2f}"))
-            self.table.setItem(row, 3, item_profit)
-
-    # (차트/재무정보 업데이트 함수는 동일함)
-    @pyqtSlot(dict)
-    def update_fundamental_ui(self, result):
-        if "error" in result: return
-        data = result['data'].get(self.target_ticker, {}).get('fundamental', {})
-        if not data: return
-        for key, label in self.fund_labels.items():
-            val = data.get(key)
-            display_text = "N/A"
-            if val is not None and isinstance(val, (int, float)):
-                if val > 1e12: display_text = f"{val/1e12:.2f}T"
-                elif val > 1e9: display_text = f"{val/1e9:.2f}B"
-                else: display_text = f"{val:,.0f}"
-            elif val is not None: display_text = str(val)
-            label.setText(display_text)
-
-    @pyqtSlot(dict)
-    def update_chart_ui(self, result):
-        if "error" in result: return
-        hist = result['data'].get(self.target_ticker, {}).get("history")
-        if not hist: return
-
-        # Timestamp 변환 (여기까지는 numpy int64 형태입니다)
-        times = pd.to_datetime(hist['Time']).astype('int64') // 10**9
-        
-        candle_data = []
-        for i in range(len(times)):
-            # ★ [수정 핵심] times[i]는 numpy.int64이므로 int()로 감싸서 표준 정수형으로 변환해야 합니다.
-            # 나머지 가격 데이터(Open, Close 등)는 float()로 감싸주는 것이 안전합니다.
-            candle_data.append((
-                int(times[i]),      # <--- 여기 수정 (int로 변환)
-                float(hist['Open'][i]), 
-                float(hist['Close'][i]), 
-                float(hist['Low'][i]), 
-                float(hist['High'][i])
-            ))
-        
-        item = CandlestickItem(candle_data)
-        self.chart_widget.addItem(item)
-        
-        # 줌 설정
-        if len(times) > 0:
-            min_x, max_x = int(times[0]), int(times[-1]) # 여기도 int 변환
-            min_y, max_y = min(hist['Low']), max(hist['High'])
-            view_box = self.chart_widget.getViewBox()
-            view_box.setLimits(xMin=min_x, xMax=max_x, yMin=min_y*0.9, yMax=max_y*1.1)
-            view_box.autoRange()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = TradingApp()
-    window.show()
-    sys.exit(app.exec())
+    parser = argparse.ArgumentParser(description="Stock Price Prediction AI")
+    
+    # 1. Ticker (필수 입력)
+    parser.add_argument(
+        "--ticker",
+        type=str,
+        required=True,
+        help="Stock ticker symbol (e.g., 005930.KS)"
+    )
+    
+    # 2. Start Date (선택 입력, 기본값 처리)
+    parser.add_argument(
+        "--start",
+        type=api.parse_date, # 문자열을 날짜 객체로 변환
+        default="2022-01-01",
+        help="Start date (YYYY-MM-DD)"
+    )
+    
+    # 3. End Date (선택 입력, 오늘 날짜 기본값)
+    parser.add_argument(
+        "--end",
+        type=api.parse_date,
+        default=datetime.date.today().strftime("%Y-%m-%d"),
+        help="End date (YYYY-MM-DD)"
+    )
+    
+    parser.add_argument(
+        "--num",
+        type=int,
+        default=0,
+        help="Fetch data size limit"
+    )
+
+    args = parser.parse_args()
+
+    if not args.ticker or args.ticker.strip() == "":
+        print("Error: Ticker must be provided.")
+        sys.exit(1)
+
+    # 실행
+    model(ticker=args.ticker, start=args.start, end=args.end, num=args.num)
