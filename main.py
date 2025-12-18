@@ -8,7 +8,7 @@ import datetime
 from sklearn.preprocessing import MinMaxScaler
 
 def model(ticker, num, start, end):
-    window_size = 50
+    window_size = 30
     if isinstance(ticker, list):
         ticker = ticker[0] # 여러 개의 티커를 받을 경우 하나만 처리
 
